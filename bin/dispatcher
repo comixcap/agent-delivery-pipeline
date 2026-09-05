@@ -1,0 +1,20 @@
+#!/bin/zsh
+# dispatcher — the always-on Telegram front-end agent.
+# A Claude Code session with the Telegram channel plugin, a dispatcher ROLE appended to the
+# system prompt, and the same allow/deny tool policy as the runners.
+# Kept alive by launchd (watchdog every 300 s) inside tmux, so the operator can close the terminal.
+export PATH="/opt/homebrew/bin:/usr/bin:/bin"
+: "${PIPELINE_ROOT:=$HOME/pipeline}"
+
+ROLE="$PIPELINE_ROOT/policy/dispatcher-role.md"
+DENY=$(cat "$PIPELINE_ROOT/policy/deny-tools.txt" 2>/dev/null)
+ALLOW=$(cat "$PIPELINE_ROOT/policy/allow-tools.txt" 2>/dev/null)
+ARGS=(--channels plugin:telegram@claude-plugins-official
+      --model claude-opus-5 --effort high
+      --permission-mode acceptEdits)
+[ -n "$ALLOW" ] && ARGS+=(--allowed-tools "$ALLOW")
+[ -n "$DENY" ]  && ARGS+=(--disallowed-tools "$DENY")
+[ -f "$ROLE" ] && ARGS+=(--append-system-prompt "$(cat "$ROLE")")
+
+# caffeinate: the Mac must not sleep while the session is alive.
+exec /usr/bin/caffeinate -dimsu /opt/homebrew/bin/claude "${ARGS[@]}"

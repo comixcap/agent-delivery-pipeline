@@ -1,0 +1,1 @@
+Bash(curl:*) Bash(wget:*) Bash(nc:*) Bash(ssh:*) Bash(scp:*) Bash(osascript:*) Bash(mail:*) Bash(git push:*) Bash(git remote add:*) Bash(rm -r:*) Bash(git clean:*) Bash(brew uninstall:*) Bash(xcrun altool:*) Bash(xcrun notarytool:*) Bash(xcodebuild -exportArchive:*) Bash(xcodebuild * archive:*) Bash(xcrun simctl:*) Bash(open -a Simulator:*)

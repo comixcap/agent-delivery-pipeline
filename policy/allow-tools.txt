@@ -1,0 +1,1 @@
+Read Edit Write Glob Grep Bash(xcodebuild:*) Bash(swift:*) Bash(grep:*) Bash(find:*) Bash(ls:*) Bash(cat:*) Bash(python3:*) Bash(bash:*) Bash(git add:*) Bash(git commit:*) Bash(git diff:*) Bash(git log:*) Bash(git status:*)

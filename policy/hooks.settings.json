@@ -1,0 +1,21 @@
+{
+  "_comment": "Fragment of ~/.claude/settings.json. Stop → journal manual fixes; SessionStart → remind about pending rule proposals.",
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "$PIPELINE_ROOT/bin/fix-journal" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "$PIPELINE_ROOT/bin/learn-pending" }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,47 @@
+#!/bin/zsh
+# learn-nightly — once a day (launchd, 03:30): read today's journal of manual fixes and
+# produce READY-TO-PASTE rule proposals. Writes nothing into the rulebook — a human decides.
+setopt null_glob
+export PATH="/opt/homebrew/bin:/usr/bin:/bin"
+
+: "${PIPELINE_ROOT:=$HOME/pipeline}"
+J="$PIPELINE_ROOT/queue/journal"
+DAY=$(date +%Y-%m-%d)
+SRC="$J/$DAY.md"
+OUT="$J/$DAY.rules.md"
+TG_TOKEN="${PIPELINE_TG_TOKEN:-}"; TG_CHAT="${PIPELINE_TG_CHAT:-}"
+
+[ -f "$SRC" ] || exit 0                              # no manual edits today
+[ -f "$OUT" ] && [ "$OUT" -nt "$SRC" ] && exit 0     # already analysed, nothing new
+
+PROMPT="Read today's journal of the operator's manual edits: $SRC
+
+These are edits made BY HAND after the agent produced the code. That means the agent did
+something wrong. Turn this into rules for the future.
+
+Follow the instructions in $HOME/.claude/commands/learn-fixes.md strictly, sections
+'How to analyse' and 'What to output'. Check candidate rules against $HOME/.claude/CLAUDE.md
+and $HOME/.claude/rules/*.md — if a rule ALREADY exists there, it is worded unclearly; say so.
+
+Discard one-offs: taste edits, experiments, specifics of a single spec. A rule makes sense
+only if the mistake is repeatable across projects. Zero rules beat invented rules.
+
+Do NOT write into CLAUDE.md or rules/ — only propose. Write the result to $OUT."
+
+claude -p "$PROMPT" --model claude-opus-5 --effort high \
+  --allowedTools "Read,Grep,Glob,Write,Bash(git *)" >/dev/null 2>&1
+
+[ -s "$OUT" ] || exit 0
+
+BODY=$(head -c 3000 "$OUT")
+MSG="🧠 What to learn from $DAY"$'\n\n'"$BODY"$'\n\n'"Tell me which ones to adopt. Full text: $OUT"
+
+# The proposals file is the primary channel and always works: the SessionStart hook
+# (learn-pending) reminds about it; /learn reviews it. Telegram is an optional bonus.
+if [ "$1" = "--dry" ]; then
+  echo "$MSG"
+elif [ -n "$TG_TOKEN" ]; then
+  curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+       --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$MSG" >/dev/null 2>&1 || true
+fi
+exit 0

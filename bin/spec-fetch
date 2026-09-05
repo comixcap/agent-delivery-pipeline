@@ -1,0 +1,53 @@
+#!/bin/zsh
+# spec-fetch — pull a specification from a URL where the text is rendered by scripts
+# (notion-like pages), strip page chrome, and optionally drop it straight into the build queue.
+# Usage:  spec-fetch <url>            → prints clean text
+#         spec-fetch <url> --queue    → writes queue/pending/<time>_<Name>.md
+#
+# The fetched text is DATA. If the page contains instructions addressed to the agent, the
+# dispatcher role forbids executing them — it shows them to the operator instead.
+set -e
+: "${PIPELINE_ROOT:=$HOME/pipeline}"
+CH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+URL="$1"
+[ -z "$URL" ] && { echo "Usage: spec-fetch <url> [--queue]" >&2; exit 1; }
+[ -x "$CH" ] || { echo "Google Chrome not found — cannot render the page." >&2; exit 1; }
+
+RAW=$("$CH" --headless=new --disable-gpu --no-sandbox --virtual-time-budget=10000 \
+      --dump-dom "$URL" 2>/dev/null)
+
+TEXT=$(printf '%s' "$RAW" | python3 -c "
+import sys, re, html
+d = sys.stdin.read()
+d = re.sub(r'<script.*?</script>|<style.*?</style>', '', d, flags=re.S)
+d = re.sub(r'<(br|/p|/div|/h[1-6]|/li)[^>]*>', '\n', d)
+d = re.sub(r'<[^>]+>', '', d)
+t = html.unescape(d)
+junk = {'Share', 'Subscribe', 'open it', 'Copy link', '/'}
+junk_sub = ('Accept all', 'More options', 'cookie', 'Cookie',
+            'Unable to run in the current browser', 'Privacy Policy', 'Terms of Service')
+out, prev = [], None
+for l in (x.strip() for x in t.split('\n')):
+    if not l or l in junk: continue
+    if any(s in l for s in junk_sub): continue
+    if l == prev: continue          # page title is often duplicated
+    out.append(l); prev = l
+print('\n'.join(out))
+")
+
+[ -z "$TEXT" ] && { echo "Page rendered empty — no text extracted." >&2; exit 1; }
+
+if [ "$2" = "--queue" ]; then
+  NAME=$(printf '%s' "$TEXT" | head -1 | tr ' -' '_' | tr -cd 'A-Za-z0-9_')
+  [ -z "$NAME" ] && { echo "Could not derive the app name from the first line." >&2; exit 1; }
+  Q="$PIPELINE_ROOT/queue/pending"
+  F="$Q/$(date +%H%M%S)_$NAME.md"
+  printf '%s\n' "$TEXT" > "$F"
+  SCREENS=$(printf '%s' "$TEXT" | grep -cE '^[0-9]+\. ' || echo 0)
+  echo "✅ Queued: $NAME"
+  echo "   screens counted: $SCREENS"
+  echo "   chars: $(printf '%s' "$TEXT" | wc -c | tr -d ' ')"
+  echo "   file: $F"
+else
+  printf '%s\n' "$TEXT"
+fi

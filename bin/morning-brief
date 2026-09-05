@@ -1,0 +1,55 @@
+#!/bin/zsh
+# morning-brief — 09:00 digest: what got built overnight, what failed, what needs a decision,
+# and which preflight failures repeat often enough to become a rule.
+setopt null_glob
+export PATH="/opt/homebrew/bin:/usr/bin:/bin"
+
+: "${PIPELINE_ROOT:=$HOME/pipeline}"
+Q="$PIPELINE_ROOT/queue"
+TG_TOKEN="${PIPELINE_TG_TOKEN:-}"; TG_CHAT="${PIPELINE_TG_CHAT:-}"
+[ -z "$TG_TOKEN" ] && [ "$1" != "--dry" ] && exit 0
+
+DONE=("$Q/done"/*.md(Nmh-16))
+FAILED=("$Q/failed"/*.md(Nmh-16))
+PENDING=("$Q/pending"/*.md(N))
+WAITING=("$Q/waiting"/*.md(N))
+RUNNING=("$Q/running"/*.md(N))
+
+# Nothing happened and the queue is empty → do not wake anyone.
+if (( ${#DONE[@]} == 0 && ${#FAILED[@]} == 0 && ${#PENDING[@]} == 0 && ${#RUNNING[@]} == 0 && ${#WAITING[@]} == 0 )); then
+  exit 0
+fi
+
+MSG="☀️ Overnight digest"$'\n'
+title() { head -1 "$1" | sed 's/^#[[:space:]]*//'; }
+
+if (( ${#DONE[@]} > 0 )); then
+  MSG="$MSG"$'\n'"✅ Built: ${#DONE[@]}"
+  for f in $DONE; do MSG="$MSG"$'\n'"   · $(title "$f")"; done
+fi
+if (( ${#FAILED[@]} > 0 )); then
+  MSG="$MSG"$'\n\n'"❌ Failed: ${#FAILED[@]}"
+  for f in $FAILED; do MSG="$MSG"$'\n'"   · $(title "$f")"; done
+  MSG="$MSG"$'\n'"   Causes: pipe log"
+fi
+if (( ${#WAITING[@]} > 0 )); then
+  MSG="$MSG"$'\n\n'"🖐 Waiting for your answer: ${#WAITING[@]}"
+  for f in $WAITING; do MSG="$MSG"$'\n'"   · $(title "$f")"; done
+  MSG="$MSG"$'\n'"   Reply: pipe answer <Project> «text»"
+fi
+(( ${#RUNNING[@]} > 0 )) && MSG="$MSG"$'\n\n'"⚙️ Running now: $(title $RUNNING[1])"
+(( ${#PENDING[@]} > 0 )) && MSG="$MSG"$'\n'"⏳ Still pending: ${#PENDING[@]}"
+
+# Repeating lessons — the ones that should become a rule.
+LFS=("$Q/lessons.d"/*.tsv(N))
+if (( ${#LFS[@]} )); then
+  REP=$(cat $LFS | cut -f2 | sort | uniq -c | sort -rn | awk '$1>=3 {$1=$1"×"; print "   · " $0}')
+  [ -n "$REP" ] && MSG="$MSG"$'\n\n'"📌 Repeating — time to write a rule:"$'\n'"$REP"
+fi
+
+if [ "$1" = "--dry" ]; then
+  echo "$MSG"
+else
+  curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+       --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$MSG" >/dev/null 2>&1
+fi

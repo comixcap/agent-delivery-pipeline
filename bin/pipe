@@ -1,0 +1,82 @@
+#!/bin/zsh
+# pipe — single entry point for the operator.
+setopt null_glob
+: "${PIPELINE_ROOT:=$HOME/pipeline}"
+export PATH="$PIPELINE_ROOT/bin:/opt/homebrew/bin:$PATH"
+B="$PIPELINE_ROOT/bin"
+Q="$PIPELINE_ROOT/queue"
+
+count() { local -a f; f=("$Q/$1"/*.md(N)); echo ${#f[@]}; }
+title() { head -1 "$1" | sed 's/^#[[:space:]]*//'; }
+
+case "$1" in
+  status|"")
+    echo "BUILD QUEUE"
+    [ -f "$Q/.paused" ] && echo "  ⏸  PAUSED (resume: pipe resume)" || echo "  ▶  active"
+    printf "  pending:  %s\n  running:  %s\n  done:     %s\n  failed:   %s\n  waiting:  %s\n" \
+      "$(count pending)" "$(count running)" "$(count done)" "$(count failed)" "$(count waiting)"
+    for d in pending running failed waiting; do
+      local -a ff; ff=("$Q/$d"/*.md(N)); (( ${#ff[@]} == 0 )) && continue
+      echo "  [$d]"; for f in $ff; do echo "    $(title "$f")"; done
+    done
+    echo "  last log lines:"; tail -3 "$Q/runner.log" 2>/dev/null | sed 's/^/    /' ;;
+  pause)   touch "$Q/.paused"; echo "paused" ;;
+  resume)  rm -f "$Q/.paused"; echo "resumed" ;;
+  spec)
+    [ -z "$2" ] && { echo "Usage: pipe spec <url>"; exit 1; }
+    "$B/spec-fetch" "$2" --queue ;;
+  answer)
+    # Answer a build that stopped with a question; it resumes in the SAME agent session.
+    if [ -z "$2" ]; then
+      W=("$Q/waiting"/*.md(N)); (( ${#W[@]} == 0 )) && { echo "Nobody is asking."; exit 0; }
+      echo "Waiting for an answer:"; for f in $W; do echo "  · $(title "$f")"; done; exit 0
+    fi
+    F=""; for f in "$Q/waiting"/*.md(N); do
+      [ "$(title "$f" | tr ' -' '_')" = "$2" ] && F="$f" && break
+    done
+    [ -z "$F" ] && { echo "«$2» is not waiting. List: pipe answer"; exit 1; }
+    shift 2; TEXT="$*"
+    [ -z "$TEXT" ] && { echo "Add the answer text."; exit 1; }
+    BASE=$(basename "$F")
+    grep -v '^# ANSWER:' "$F" > "$F.tmp"
+    { head -1 "$F.tmp"; echo "# ANSWER: $TEXT"; tail -n +2 "$F.tmp"; } > "$Q/pending/$BASE"
+    rm -f "$F" "$F.tmp"
+    echo "Answer delivered. «$2» resumes within two minutes." ;;
+  par)
+    C="$HOME/.claude/conveyor.conf"
+    if [ -n "$2" ]; then
+      grep -v '^BUILD_PARALLEL=' "$C" 2>/dev/null > "$C.tmp"; echo "BUILD_PARALLEL=$2" >> "$C.tmp"; mv "$C.tmp" "$C"
+      echo "concurrent builds: $2"
+    else
+      echo "concurrent builds: $(sed -n 's/^BUILD_PARALLEL=//p' "$C" 2>/dev/null || echo 6)"
+    fi ;;
+  log)
+    LD="$Q/logs"
+    if [ -n "$2" ]; then tail -n 40 "$LD/$2.log" 2>/dev/null || echo "no log for «$2»"
+    else tail -n 12 "$Q/runner.log" 2>/dev/null; fi ;;
+  log-tasks) tail -n "${2:-30}" "$Q/tasks.log" ;;
+  lessons)
+    FS=("$Q/lessons.d"/*.tsv(N)); (( ${#FS[@]} == 0 )) && { echo "Empty — lessons accumulate after builds."; exit 0; }
+    echo "  WHAT PREFLIGHT TRIPS ON MOST OFTEN"
+    cat $FS | cut -f2 | sort | uniq -c | sort -rn | while read -r n txt; do
+      mark=""; [ "$n" -ge 3 ] && mark="  ← time to write a rule"
+      printf "  %2s×  %s%s\n" "$n" "$txt" "$mark"
+    done ;;
+  brief)   "$B/morning-brief" --dry ;;
+  learn)   "$B/learn-nightly" --dry ;;
+  help|-h|--help)
+    cat <<'HELP'
+  pipe                 queue status
+  pipe spec <url>      fetch a spec from a URL and queue it
+  pipe answer <P> «…»  answer a build that stopped with a question
+  pipe pause|resume    stop/continue dispatching
+  pipe par <N>         concurrent builds
+  pipe log [Project]   dispatcher log or one build's log
+  pipe log-tasks       fast-lane log
+  pipe lessons         repeating preflight failures
+  pipe brief           overnight digest (dry run)
+  pipe learn           tonight's rule proposals (dry run)
+HELP
+    ;;
+  *) echo "unknown command: $1 (pipe help)"; exit 1 ;;
+esac

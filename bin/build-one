@@ -1,0 +1,213 @@
+#!/bin/zsh
+# build-one — one build from spec to release-ready project, start to finish.
+# Spawned by build-runner as a separate process. Argument: path to the spec file in queue/running/.
+#
+# Stages:  1 scaffold → 2 /auto (agent builds from spec) → 3 /polish (agent audits) →
+#          4 registry recheck → 5 control compile + preflight gate.
+# Every stage is observable from Telegram; every failure moves the spec to queue/failed/.
+setopt null_glob
+export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin"
+
+: "${PIPELINE_ROOT:=$HOME/pipeline}"
+TASK="$1"; [ -f "$TASK" ] || exit 1
+Q="$PIPELINE_ROOT/queue"
+BASE=$(basename "$TASK")
+MODEL="claude-opus-5"; EFFORT="high"
+DENY=$(cat "$PIPELINE_ROOT/policy/deny-tools.txt" 2>/dev/null)
+ALLOW=$(cat "$PIPELINE_ROOT/policy/allow-tools.txt" 2>/dev/null)
+
+# Telegram reporting is optional: no token → the pipeline runs silently, nothing else changes.
+TG_TOKEN="${PIPELINE_TG_TOKEN:-}"; TG_CHAT="${PIPELINE_TG_CHAT:-}"
+
+NAME=$(head -1 "$TASK" | sed 's/^#[[:space:]]*//' | tr ' -' '_' | tr -cd 'A-Za-z0-9_')
+[ -z "$NAME" ] && { mv "$TASK" "$Q/failed/$BASE"; exit 1; }
+
+LOG="$Q/logs/$NAME.log"                     # one log per build — parallel builds must not interleave
+PROJ="$HOME/Desktop/$NAME"
+SPEC_TEXT=$(tail -n +2 "$TASK")
+START=$(date +%s)
+MSG_ID=""
+
+log()  { echo "$(date '+%H:%M:%S')  $*" >> "$LOG"; }
+el()   { echo $(( ($(date +%s) - START) / 60 )); }
+
+tg_new() { [ -z "$TG_TOKEN" ] && return 0
+  MSG_ID=$(curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+      --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$1" \
+    | python3 -c 'import sys,json
+try: print(json.load(sys.stdin)["result"]["message_id"])
+except Exception: print("")' 2>/dev/null); }
+
+tg_edit() { [ -z "$TG_TOKEN" ] && return 0
+  [ -z "$MSG_ID" ] && { tg_new "$1"; return 0; }
+  curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/editMessageText" \
+       --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "message_id=${MSG_ID}" \
+       --data-urlencode "text=$1" >/dev/null 2>&1; }
+
+# --- Live progress: edits one Telegram message while a long stage runs. ---
+# Shows REAL quantities: how many source files exist, minutes elapsed, and whether the log
+# has gone quiet (a silent agent for 10+ minutes is the earliest sign of a stuck run).
+TICK_PID=""
+tick_start() {
+  local stage="$1"
+  (
+    while :; do
+      sleep 90
+      local n bar filled i quiet mark
+      n=$(find "$PROJ/$NAME" -name '*.swift' 2>/dev/null | wc -l | tr -d ' ')
+      filled=$(( n * 8 / 34 )); (( filled > 8 )) && filled=8; (( filled < 0 )) && filled=0
+      bar=""
+      for i in {1..8}; do (( i <= filled )) && bar="$bar▰" || bar="$bar▱"; done
+      quiet=$(( ( $(date +%s) - $(stat -f %m "$LOG" 2>/dev/null || echo 0) ) / 60 ))
+      if (( quiet >= 10 )); then mark="quiet for $quiet min — check on it"; else mark="writing"; fi
+      tg_edit "⚙️ $NAME
+$stage
+
+$bar  files: $n
+$(el) min · $mark"
+    done
+  ) &
+  TICK_PID=$!
+}
+tick_stop() {
+  [ -z "$TICK_PID" ] && return 0
+  pkill -P "$TICK_PID" 2>/dev/null; kill "$TICK_PID" 2>/dev/null; wait "$TICK_PID" 2>/dev/null
+  TICK_PID=""
+}
+
+# Git snapshot after each stage — the only way to roll back a polish pass that made things worse.
+snap() { [ -d "$PROJ/.git" ] || return 0
+  git -C "$PROJ" add -A 2>/dev/null
+  git -C "$PROJ" -c user.name="pipeline" -c user.email="pipeline@local" \
+      commit -q -m "$1" >/dev/null 2>&1; log "git snapshot: $1"; }
+
+# --- Simulators: the pipeline never tests in them and must not leave traces. ---
+# If an agent launches the app anyway, it walks through onboarding and the "onboarded" flag
+# stays in the simulator's defaults. The human tester then sees loader → main screen with no
+# onboarding. The cfprefsd cache survives reinstalling the app, so both the plist files and
+# the devices are cleaned.
+sim_clean() {
+  local bid
+  bid=$(sed -n 's/.*PRODUCT_BUNDLE_IDENTIFIER = \([^;]*\);.*/\1/p' \
+        "$PROJ/$NAME.xcodeproj/project.pbxproj" 2>/dev/null | head -1 | tr -d ' "')
+  xcrun simctl shutdown all >/dev/null 2>&1
+  [ -z "$bid" ] && { log "simulators shut down (bundle id unreadable)"; return 0; }
+  find "$HOME/Library/Developer/CoreSimulator/Devices" \
+       "$HOME/Library/Developer/Xcode/UserData/Previews" \
+       -name "$bid.plist" -path "*Preferences*" -delete 2>/dev/null
+  log "simulators shut down, defaults for $bid wiped — onboarding will show from scratch"
+}
+
+fail() { tick_stop; local m; m=$(el)
+  log "FAILED at stage: $1 (${m} min)"
+  sim_clean
+  mv "$TASK" "$Q/failed/$BASE" 2>/dev/null
+  tg_edit "❌ $NAME — stopped at «$1» after ${m} min
+Project: ~/Desktop/$NAME · log: pipe log $NAME"
+  exit 0; }
+
+SIM=$(xcrun simctl list devices available 2>/dev/null \
+      | grep -oE '^\s+iPhone [^(]*' | sed 's/^ *//;s/ *$//' | head -1)
+[ -z "$SIM" ] && SIM="iPhone SE (3rd generation)"
+
+log "=== START $NAME · simulator $SIM ==="
+tg_new "🔨 $NAME
+Stage 1 of 5 · scaffolding project"
+
+[ -d "$PROJ" ] || "$PIPELINE_ROOT/bin/newproj" "$NAME" >> "$LOG" 2>&1 || fail "scaffold"
+cd "$PROJ" || fail "cd into project"
+
+ANSWER=$(grep -m1 '^# ANSWER:' "$TASK" | sed 's/^# ANSWER:[[:space:]]*//')
+AUTO_OUT="$Q/running/$NAME.auto.txt"
+
+tg_edit "⚙️ $NAME
+Stage 2 of 5 · building from spec · $(el) min"
+if [ -n "$DRY_RUN" ]; then log "DRY_RUN: skipping /auto"
+elif [ -n "$ANSWER" ]; then
+  # The build previously stopped with a question (see below); resume the SAME session with the answer.
+  log "resuming previous session with answer: $ANSWER"
+  claude -p --continue "$ANSWER" --model "$MODEL" --effort "$EFFORT" \
+    --permission-mode acceptEdits --allowed-tools "$ALLOW" --disallowed-tools "$DENY" > "$AUTO_OUT" 2>&1 || fail "/auto (resume)"
+  cat "$AUTO_OUT" >> "$LOG"
+else
+  log "running /auto"
+  tick_start "Stage 2 of 5 · building from spec"
+  claude -p "/auto
+$SPEC_TEXT" --model "$MODEL" --effort "$EFFORT" --permission-mode acceptEdits --allowed-tools "$ALLOW" --disallowed-tools "$DENY" \
+    > "$AUTO_OUT" 2>&1 || { tick_stop; fail "/auto"; }
+  tick_stop
+  cat "$AUTO_OUT" >> "$LOG"
+fi
+snap "after /auto"
+
+# --- CHECK: did the build actually happen, or did the agent stop with a question? ---
+# /auto is required to ASK when the spec's domain collides with the registry. In the
+# background nobody answers: the session prints its question and exits with success.
+# Without this check the pipeline would report "done" on an empty skeleton.
+if [ -z "$DRY_RUN" ]; then
+  SWIFTS=$(find "$PROJ/$NAME" -name '*.swift' 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$SWIFTS" -lt 8 ] || [ ! -f "$PROJ/$NAME/Shared/Glyphs.swift" ]; then
+    log "BUILD DID NOT HAPPEN: .swift files = $SWIFTS — /auto most likely stopped with a question"
+    mv "$TASK" "$Q/waiting/$BASE" 2>/dev/null
+    tg_edit "🖐 $NAME — needs your answer
+The build stopped and is asking. Most likely the domain matches something already built.
+
+$(tail -c 700 "$AUTO_OUT")
+
+Reply with:  pipe answer $NAME «your answer»"
+    exit 0
+  fi
+fi
+
+log "preflight"
+bash "$PIPELINE_ROOT/gates/preflight.sh" > "$Q/running/$NAME.preflight.txt" 2>&1
+PF=$(grep -c "FAIL" "$Q/running/$NAME.preflight.txt" 2>/dev/null || echo 0)
+
+tg_edit "✨ $NAME
+Stage 3 of 5 · polish · preflight FAIL: $PF · $(el) min"
+log "running /polish"
+if [ -n "$DRY_RUN" ]; then log "DRY_RUN: skipping /polish"; else
+  tick_start "Stage 3 of 5 · polish"
+  claude -p "/polish" --model "$MODEL" --effort "$EFFORT" --permission-mode acceptEdits --allowed-tools "$ALLOW" --disallowed-tools "$DENY" \
+    >> "$LOG" 2>&1 || { tick_stop; fail "/polish"; }
+  tick_stop; fi
+snap "after /polish"
+
+tg_edit "📒 $NAME
+Stage 4 of 5 · registry recheck · $(el) min"
+log "registry recheck"
+if [ -n "$DRY_RUN" ]; then log "DRY_RUN: skipping /ledger-recheck"; else
+  claude -p "/ledger-recheck" --model "$MODEL" --effort "$EFFORT" --permission-mode acceptEdits --allowed-tools "$ALLOW" --disallowed-tools "$DENY" \
+    >> "$LOG" 2>&1 || log "warning: registry recheck errored, continuing"; fi
+snap "after registry recheck"
+
+tg_edit "🧱 $NAME
+Stage 5 of 5 · control build · $(el) min"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+xcodebuild -project "$PROJ/$NAME.xcodeproj" -scheme "$NAME" \
+  -destination "platform=iOS Simulator,name=$SIM" build \
+  > "$Q/running/$NAME.build.txt" 2>&1
+grep -q "BUILD SUCCEEDED" "$Q/running/$NAME.build.txt" || fail "final build"
+
+bash "$PIPELINE_ROOT/gates/preflight.sh" > "$Q/running/$NAME.preflight2.txt" 2>&1
+PF2=$(grep -c "FAIL" "$Q/running/$NAME.preflight2.txt" 2>/dev/null || echo 0)
+
+# Lessons go to a PER-BUILD file so parallel builds never write to the same one.
+grep "FAIL" "$Q/running/$NAME.preflight2.txt" 2>/dev/null | grep -v "TOTAL" \
+  | sed $'s/\033\[[0-9;]*m//g' | sed "s/^[[:space:]]*FAIL[[:space:]]*//;s/=.*//;s/[[:space:]]*$//" \
+  | while read -r l; do [ -n "$l" ] && printf '%s\t%s\n' "$NAME" "$l"; done > "$Q/lessons.d/$NAME.tsv"
+
+sim_clean
+
+MINS=$(el)
+mv "$TASK" "$Q/done/$BASE"
+mv "$Q/running/$NAME".*.txt "$Q/done/" 2>/dev/null
+
+WARN=""
+[ "$PF2" != "0" ] && WARN="
+⚠️ preflight still reports FAIL: $PF2 — pipe log $NAME"
+
+log "=== DONE $NAME in $MINS min · preflight FAIL after polish: $PF2 ==="
+tg_edit "✅ $NAME · $MINS min
+BUILD SUCCEEDED · preflight FAIL: $PF2$WARN
+Project: ~/Desktop/$NAME — ready for a human test."

@@ -1,0 +1,115 @@
+#!/bin/zsh
+# task-runner — the FAST lane: store-review replies, recolors, targeted fixes.
+# Runs every 60 s from launchd, in parallel with the build lane. Up to two tasks at once.
+setopt null_glob
+export PATH="/opt/homebrew/bin:/usr/bin:/bin"
+
+: "${PIPELINE_ROOT:=$HOME/pipeline}"
+Q="$PIPELINE_ROOT/queue/tasks"
+LOG="$PIPELINE_ROOT/queue/tasks.log"
+MODEL="claude-opus-5"; EFFORT="high"; MAXPAR=2
+DENY=$(cat "$PIPELINE_ROOT/policy/deny-tools.txt" 2>/dev/null)
+ALLOW=$(cat "$PIPELINE_ROOT/policy/allow-tools.txt" 2>/dev/null)
+TG_TOKEN="${PIPELINE_TG_TOKEN:-}"; TG_CHAT="${PIPELINE_TG_CHAT:-}"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S')  $*" >> "$LOG"; }
+tg()  { [ -z "$TG_TOKEN" ] && return 0
+        curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+             --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$1" >/dev/null 2>&1; }
+
+[ -f "$Q/../.paused" ] && exit 0
+
+BUSY=("$Q/running"/*.md(N))
+(( ${#BUSY[@]} >= MAXPAR )) && exit 0
+
+TASKS=("$Q/pending"/*.md(NOm))
+(( ${#TASKS[@]} == 0 )) && exit 0
+TASK="${TASKS[1]}"; BASE=$(basename "$TASK")
+
+# Task file format:
+#   # TYPE: reject|review|recolor|fix
+#   # PROJECT: <ProjectName>
+#   <free text: the rejection letter, the request, what to fix>
+TYPE=$(grep -m1 '^# TYPE:'    "$TASK" | sed 's/^# TYPE:[[:space:]]*//')
+PROJ_N=$(grep -m1 '^# PROJECT:' "$TASK" | sed 's/^# PROJECT:[[:space:]]*//')
+BODY=$(grep -v '^# TYPE:\|^# PROJECT:' "$TASK")
+
+mv "$TASK" "$Q/running/$BASE"; TASK="$Q/running/$BASE"
+START=$(date +%s)
+
+PROJ=""
+for base in "$HOME/Desktop" "$PIPELINE_ROOT/archive" "$HOME/Downloads"; do
+  [ -d "$base/$PROJ_N" ] && { PROJ="$base/$PROJ_N"; break; }
+done
+
+sim_clean() {
+  local bid
+  [ -z "$PROJ" ] && return 0
+  bid=$(sed -n 's/.*PRODUCT_BUNDLE_IDENTIFIER = \([^;]*\);.*/\1/p' \
+        "$PROJ/$PROJ_N.xcodeproj/project.pbxproj" 2>/dev/null | head -1 | tr -d ' "')
+  xcrun simctl shutdown all >/dev/null 2>&1
+  [ -z "$bid" ] && return 0
+  find "$HOME/Library/Developer/CoreSimulator/Devices" \
+       "$HOME/Library/Developer/Xcode/UserData/Previews" \
+       -name "$bid.plist" -path "*Preferences*" -delete 2>/dev/null
+}
+
+finish() {
+  local mins=$(( ($(date +%s) - START) / 60 ))
+  sim_clean
+  mv "$TASK" "$Q/$2/$BASE" 2>/dev/null
+  log "$TYPE / $PROJ_N — $2 in ${mins} min"
+}
+
+if [ -z "$PROJ" ]; then
+  tg "❓ Task «$TYPE» — project folder «$PROJ_N» not found. Check the name and resend."
+  finish "" failed; exit 0
+fi
+
+# Each task type maps to a workflow. A workflow is a versioned prompt file, not an ad-hoc message.
+case "$TYPE" in
+  reject)  CMD="/apple-info";   TITLE="Reply to rejection (Information Needed)" ;;
+  review)  CMD="/apple-review"; TITLE="Reply to reviewer" ;;
+  recolor) CMD="/repalette";    TITLE="Recolor" ;;
+  fix)     CMD="";              TITLE="Targeted fix" ;;
+  *)       CMD="";              TITLE="Task" ;;
+esac
+
+log "START $TYPE / $PROJ_N"
+tg "🔧 $TITLE · $PROJ_N
+Picked up, result will be posted here."
+
+cd "$PROJ" || { finish "" failed; exit 0; }
+
+if [ -n "$CMD" ]; then PROMPT="$CMD
+$BODY"; else PROMPT="$BODY"; fi
+
+OUT="$Q/running/$BASE.out.txt"
+if [ -n "$DRY_RUN" ]; then
+  log "DRY_RUN: skipping claude"; echo "(dry run)" > "$OUT"
+else
+  claude -p "$PROMPT" --model "$MODEL" --effort "$EFFORT" \
+    --permission-mode acceptEdits --allowed-tools "$ALLOW" --disallowed-tools "$DENY" > "$OUT" 2>&1 || {
+      tg "❌ $TITLE · $PROJ_N — failed. Details: pipe log-tasks"
+      finish "" failed; exit 0; }
+fi
+
+MINS=$(( ($(date +%s) - START) / 60 ))
+
+# For review replies the deliverable is the text itself — send it whole.
+ANSWER=""
+for f in "$PROJ/APPLE_REVIEW_INFO_RESPONSE.txt" "$PROJ/APPLE_REVIEW_RESPONSE.txt"; do
+  [ -f "$f" ] && [ "$TYPE" = "reject" -o "$TYPE" = "review" ] && ANSWER=$(head -c 3600 "$f") && break
+done
+
+if [ -n "$ANSWER" ]; then
+  tg "✅ $TITLE · $PROJ_N · $MINS min
+Ready text below — copy and send."
+  tg "$ANSWER"
+else
+  tg "✅ $TITLE · $PROJ_N · $MINS min
+$(tail -c 900 "$OUT")"
+fi
+
+mv "$OUT" "$Q/done/" 2>/dev/null
+finish "" done

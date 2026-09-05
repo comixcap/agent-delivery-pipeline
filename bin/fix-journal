@@ -1,0 +1,64 @@
+#!/bin/zsh
+# fix-journal — Claude Code `Stop` hook.
+# Captures the traces of MANUAL edits the operator made after the agent finished.
+# Works both in git repositories and in plain folders (most generated projects are not under git).
+# It does not analyse anything — it only saves the diff so it survives session deletion.
+# The nightly `learn-nightly` agent turns the journal into proposed rules.
+setopt null_glob
+export PATH="/opt/homebrew/bin:/usr/bin:/bin"
+
+: "${PIPELINE_ROOT:=$HOME/pipeline}"
+J="$PIPELINE_ROOT/queue/journal"
+SNAP="$J/.snap"
+mkdir -p "$J" "$SNAP"
+
+CWD="${CLAUDE_PROJECT_DIR:-$PWD}"
+[ -d "$CWD" ] || exit 0
+# Reference projects are read-only by policy; there are never manual edits there.
+case "$CWD" in
+  "$PIPELINE_ROOT/reference"*) exit 0 ;;
+esac
+
+PROJ=$(basename "$CWD")
+DAY=$(date +%Y-%m-%d)
+OUT="$J/$DAY.md"
+BODY=""
+
+if git -C "$CWD" rev-parse --git-dir >/dev/null 2>&1; then
+  # --- repositories: an honest git diff
+  D=$(git -C "$CWD" diff HEAD 2>/dev/null | head -400)
+  [ -z "$D" ] && exit 0
+  STAT=$(git -C "$CWD" diff --stat HEAD 2>/dev/null)
+  BODY="$STAT"$'\n```diff\n'"$D"$'\n```'
+else
+  # --- plain folders: shadow copy of sources + diff against it
+  SH="$SNAP/$PROJ"
+  FIRST=0; [ -d "$SH" ] || FIRST=1      # first run only takes the shadow
+  CHANGED=""
+  while IFS= read -r f; do
+    rel="${f#$CWD/}"
+    old="$SH/$rel"
+    if [ ! -f "$old" ]; then
+      CHANGED="$CHANGED"$'\n'"+ new: $rel"
+    elif ! cmp -s "$f" "$old"; then
+      CHANGED="$CHANGED"$'\n'"~ changed: $rel"$'\n```diff\n'"$(diff -u "$old" "$f" | head -120)"$'\n```'
+    fi
+  done < <(find "$CWD" \( -name '*.swift' -o -name '*.kt' \) -not -path '*/.*' -type f 2>/dev/null)
+
+  # Refresh the shadow either way — otherwise the same diff resurfaces every session.
+  rm -rf "$SH"; mkdir -p "$SH"
+  cd "$CWD" || exit 0
+  find . \( -name '*.swift' -o -name '*.kt' \) -not -path '*/.*' -type f | while IFS= read -r r; do
+    mkdir -p "$SH/$(dirname "$r")" && cp "$r" "$SH/$r"
+  done
+
+  (( FIRST )) && exit 0
+  [ -z "$CHANGED" ] && exit 0
+  BODY="$CHANGED"
+fi
+
+{
+  echo ""
+  echo "## $(date '+%H:%M') — $PROJ"
+  echo "$BODY"
+} >> "$OUT"

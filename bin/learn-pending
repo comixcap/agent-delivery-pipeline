@@ -1,0 +1,13 @@
+#!/bin/zsh
+# learn-pending — Claude Code `SessionStart` hook.
+# Quietly reminds about rule proposals that have not been reviewed yet.
+# Silent when there is nothing to propose, so it never becomes noise.
+setopt null_glob
+: "${PIPELINE_ROOT:=$HOME/pipeline}"
+J="$PIPELINE_ROOT/queue/journal"
+N=0
+for f in "$J"/*.rules.md; do
+  head -1 "$f" | grep -q "ADOPTED" || (( N++ ))
+done
+(( N == 0 )) && exit 0
+echo "📋 Pending rule proposals: $N (over $(ls "$J"/*.rules.md | wc -l | tr -d ' ') days). Review with /learn"

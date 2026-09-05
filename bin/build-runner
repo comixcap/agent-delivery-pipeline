@@ -1,0 +1,70 @@
+#!/bin/zsh
+# build-runner — queue dispatcher for the BUILD lane.
+# Runs every 120 s from launchd. Hands pending specs to `build-one` processes and exits
+# immediately; it never builds anything itself.
+setopt null_glob
+export PATH="/opt/homebrew/bin:/usr/bin:/bin"
+
+: "${PIPELINE_ROOT:=$HOME/pipeline}"
+Q="$PIPELINE_ROOT/queue"
+LOG="$Q/runner.log"
+CONF="$HOME/.claude/conveyor.conf"
+LEDGER="$HOME/.claude/shape-ledger.md"
+
+# Max concurrent builds. Change at runtime: pipe par <N>
+MAXPAR=6
+[ -f "$CONF" ] && MAXPAR=$(sed -n 's/^BUILD_PARALLEL=//p' "$CONF" | head -1)
+[ -z "$MAXPAR" ] && MAXPAR=6
+
+DENY=$(cat "$PIPELINE_ROOT/policy/deny-tools.txt" 2>/dev/null)
+ALLOW=$(cat "$PIPELINE_ROOT/policy/allow-tools.txt" 2>/dev/null)
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S')  $*" >> "$LOG"; }
+
+[ -f "$Q/.paused" ] && exit 0
+
+PENDING=("$Q/pending"/*.md(NOm))
+(( ${#PENDING[@]} == 0 )) && exit 0
+
+RUNNING=("$Q/running"/*.md(N))
+FREE=$(( MAXPAR - ${#RUNNING[@]} ))
+(( FREE <= 0 )) && exit 0
+
+# --- Before PARALLEL start, every spec must carry a pre-assigned design fingerprint. ---
+# Otherwise N concurrent agents read the same registry and honestly pick the same palette
+# and layout archetype. A single "distributor" agent assigns the axes first.
+UNASSIGNED=()
+for f in $PENDING; do
+  grep -q "FINGERPRINT ASSIGNED" "$f" || UNASSIGNED+=("$f")
+done
+
+if (( ${#UNASSIGNED[@]} >= 2 )); then
+  if [ ! -f "$Q/.distributing" ]; then
+    echo $$ > "$Q/.distributing"
+    log "specs without assigned fingerprint: ${#UNASSIGNED[@]} — running distributor"
+    cd "$HOME/Desktop" && claude -p "/distribute" --model claude-opus-5 --effort high \
+      --permission-mode acceptEdits --allowed-tools "$ALLOW" --disallowed-tools "$DENY" >> "$LOG" 2>&1
+    rm -f "$Q/.distributing"
+    log "distributor finished"
+  fi
+  exit 0     # next tick dispatches the now-annotated specs
+fi
+
+# --- Registry safety net: parallel builds append to it at the end of each run. ---
+cp "$LEDGER" "$Q/ledger-backups/shape-ledger-$(date +%Y%m%d-%H%M%S).md" 2>/dev/null
+BACKUPS=("$Q/ledger-backups"/*.md(NOm))
+(( ${#BACKUPS[@]} > 40 )) && rm -f "${BACKUPS[1]}" 2>/dev/null
+
+STARTED=0
+for f in $PENDING; do
+  (( STARTED >= FREE )) && break
+  BASE=$(basename "$f")
+  mv "$f" "$Q/running/$BASE" 2>/dev/null || continue   # atomic claim: mv either succeeds or another runner took it
+  NAME=$(head -1 "$Q/running/$BASE" | sed 's/^#[[:space:]]*//')
+  log "starting build: $NAME"
+  nohup "$PIPELINE_ROOT/bin/build-one" "$Q/running/$BASE" >/dev/null 2>&1 &
+  disown
+  STARTED=$(( STARTED + 1 ))
+done
+
+(( STARTED > 0 )) && log "builds started: $STARTED (cap $MAXPAR, already running ${#RUNNING[@]})"
