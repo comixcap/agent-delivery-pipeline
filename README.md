@@ -10,9 +10,10 @@ parallel on one Mac, with a Telegram front-end and no human in the loop between 
 received" and "build succeeded, ready for a human test".
 
 What is in this repository is the *system*: orchestration, roles, policies, gates, the
-self-improvement loop, and a retrieval + eval harness over the rulebook. What is not here:
-client specs, the reference project the agents copy infrastructure from, and the full
-rulebook (two chapters are included as samples).
+self-improvement loop, a retrieval + eval harness over the rulebook, and the Android branch
+that turned it into a two-platform pipeline. What is not here: client specs, client apps
+(all under NDA), the reference projects the agents copy infrastructure from, and the full
+rulebook (three chapters are included as samples).
 
 ```
 spec (Telegram / URL / file)
@@ -72,7 +73,9 @@ So the system does three things a chat window cannot:
 | `gates/printcheck.py` | app fingerprint (type names, file names, keywords, privacy text, bundle ID) vs. the registry |
 | `launchd/` | five background agents and why `AbandonProcessGroup` matters |
 | `rag/` | BM25 retrieval over the rulebook + eval harness (hit@k, MRR, abstention) |
+| `rulebook/android-games.md`, `workflows/droid-*.md`, `tools/soundgen.py` | the Android branch: platform rulebook, three workflows, audio generator |
 | `docs/failure-catalog.md` | agent failure classes observed in production and the gate for each |
+| `docs/android-port.md` | case study: porting the pipeline to a second platform in one iteration |
 
 ## Design decisions worth defending
 
