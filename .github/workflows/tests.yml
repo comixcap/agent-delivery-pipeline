@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rag:
+    name: rulebook_rag — unit tests + retrieval eval
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Unit tests
+        working-directory: rag
+        run: python -m unittest discover -s tests -v
+      - name: Build index and run retrieval eval (fails if hit@3 < 0.8)
+        working-directory: rag
+        run: |
+          python -m rulebook_rag.index build ../rulebook index.json
+          python -m rulebook_rag.evaluate index.json evalset.json
+
+  shell:
+    name: scripts — syntax check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: zsh -n on every runner script
+        run: for f in bin/*; do zsh -n "$f" && echo "ok $f"; done
+      - name: bash -n preflight, py_compile gates and tools
+        run: |
+          bash -n gates/preflight.sh
+          python3 -m py_compile gates/printcheck.py tools/soundgen.py
+      - name: soundgen produces six WAV files
+        run: |
+          python3 tools/soundgen.py /tmp/sg
+          test "$(ls /tmp/sg/*.wav | wc -l)" -eq 6

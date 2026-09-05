@@ -1,5 +1,7 @@
 # agent-delivery-pipeline
 
+[![tests](https://github.com/comixcap/agent-delivery-pipeline/actions/workflows/tests.yml/badge.svg)](https://github.com/comixcap/agent-delivery-pipeline/actions/workflows/tests.yml)
+
 **A multi-agent system that turns a client specification into a release-ready mobile app
 build — and the quality gates that keep the agents honest.**
 
