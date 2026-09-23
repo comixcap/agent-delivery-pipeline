@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Telegram receiver for the operator bridge (replaced the Telegram MCP plugin).
+
+The only consumer of getUpdates for the bot:
+- long-polls the Bot API and accepts messages from the operator's chat only;
+- immediately shows "typing..." so the operator sees the message arrived, and keeps
+  it on until tg-reply marks that an answer went out;
+- a short single-line text is injected into the dispatcher's tmux session as
+  `[TG msg_id=N] <text>`; a long or multi-line text is saved to inbox/ and the session
+  gets a pointer to the file, so line breaks of a spec are never lost;
+- photos and documents are downloaded into inbox/, the session gets the path.
+
+Run by launchd with KeepAlive: if it dies, it comes back.
+HTTP 409 means a SECOND getUpdates consumer appeared (typically an old MCP plugin
+started by some session). That is the real cause of "the channel dropped"; the fix is
+to remove the duplicate, not to restart the receiver.
+
+Config (environment):
+  PIPELINE_TG_CHAT      operator chat id (required)
+  PIPELINE_BRIDGE_DIR   state dir, default ~/.pipeline/telegram  (holds .env with
+                        TELEGRAM_BOT_TOKEN=..., .offset, inbox/, poller.log)
+  PIPELINE_TMUX_SESSION dispatcher session name, default claude-tg
+"""
+import json
+import os
+import shutil
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE = os.environ.get("PIPELINE_BRIDGE_DIR", os.path.expanduser("~/.pipeline/telegram"))
+ENV_FILE = f"{BASE}/.env"
+OFFSET_FILE = f"{BASE}/.offset"
+INBOX = f"{BASE}/inbox"
+LOG = f"{BASE}/poller.log"
+REPLY_MARK = f"{BASE}/.last-reply"
+CHAT = int(os.environ.get("PIPELINE_TG_CHAT", "0"))
+TMUX_SESSION = os.environ.get("PIPELINE_TMUX_SESSION", "claude-tg")
+TMUX = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
+INLINE_LIMIT = 300
+REPLY_RULE = " <- answer ONLY via tg-reply, text typed into the session is invisible to the operator"
+
+
+def log(msg):
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 200_000:   # keep the log bounded
+            with open(LOG, encoding="utf-8") as f:
+                tail = f.readlines()[-100:]
+            with open(LOG, "w", encoding="utf-8") as f:
+                f.writelines(tail)
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%F %T')} {msg}\n")
+    except OSError:
+        pass
+
+
+def token():
+    with open(ENV_FILE, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    raise RuntimeError("no bot token in " + ENV_FILE)
+
+
+def api(tok, method, params, timeout=60):
+    data = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/{method}", data=data)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def download(tok, file_id, dest_name):
+    os.makedirs(INBOX, exist_ok=True)
+    info = api(tok, "getFile", {"file_id": file_id}, timeout=30)
+    path = info["result"]["file_path"]
+    ext = os.path.splitext(path)[1]
+    dest = os.path.join(INBOX, dest_name if "." in dest_name else dest_name + ext)
+    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{tok}/{path}", timeout=120) as r, \
+            open(dest, "wb") as f:
+        f.write(r.read())
+    return dest
+
+
+def inject(line):
+    subprocess.run([TMUX, "send-keys", "-t", TMUX_SESSION, "-l", line], check=True)
+    subprocess.run([TMUX, "send-keys", "-t", TMUX_SESSION, "Enter"], check=True)
+
+
+def render(msg, tok=None, fetch=download):
+    """Turn a Telegram message into the one line the dispatcher session receives.
+    Pure except for writing long texts / attachments into inbox/ — unit-tested."""
+    mid = msg["message_id"]
+    parts = []
+    text = msg.get("text") or msg.get("caption") or ""
+    if "photo" in msg:
+        biggest = max(msg["photo"], key=lambda p: p.get("file_size") or 0)
+        parts.append("photo: " + fetch(tok, biggest["file_id"], f"{mid}_photo"))
+    if "document" in msg:
+        doc = msg["document"]
+        name = doc.get("file_name") or f"{mid}_file"
+        parts.append("file: " + fetch(tok, doc["file_id"], f"{mid}_{name}"))
+    if text:
+        if len(text) <= INLINE_LIMIT and "\n" not in text:
+            parts.append(text)
+        else:
+            os.makedirs(INBOX, exist_ok=True)
+            fpath = os.path.join(INBOX, f"{mid}.txt")
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(text)
+            first = text.splitlines()[0][:80]
+            parts.append(f"long message starting «{first}», full text: {fpath}")
+    if not parts:
+        parts.append("message without text (sticker/voice?) - tell the operator it is not supported yet")
+    return f"[TG msg_id={mid}] " + " · ".join(parts) + REPLY_RULE
+
+
+def typing_until_reply(tok, cap=240):
+    """Keep "typing..." on from delivery until an answer actually goes out."""
+    started = time.time()
+    while time.time() - started < cap:
+        try:
+            if os.path.getmtime(REPLY_MARK) >= started:
+                return
+        except OSError:
+            pass
+        try:
+            api(tok, "sendChatAction", {"chat_id": CHAT, "action": "typing"}, timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(5)
+
+
+def main():
+    if not CHAT:
+        raise SystemExit("set PIPELINE_TG_CHAT")
+    tok = token()
+    offset = 0
+    try:
+        with open(OFFSET_FILE, encoding="utf-8") as f:
+            offset = int(f.read().strip())
+    except (OSError, ValueError):
+        pass
+    log("receiver started")
+    while True:
+        try:
+            resp = api(tok, "getUpdates", {"timeout": 50, "offset": offset + 1}, timeout=70)
+            for upd in resp.get("result", []):
+                offset = max(offset, upd["update_id"])
+                with open(OFFSET_FILE, "w", encoding="utf-8") as f:   # at-most-once after restart
+                    f.write(str(offset))
+                msg = upd.get("message")
+                if not msg:
+                    continue
+                if msg.get("chat", {}).get("id") != CHAT:
+                    log(f"foreign chat {msg.get('chat', {}).get('id')} ignored")
+                    continue
+                try:
+                    inject(render(msg, tok))
+                    log(f"msg {msg['message_id']} delivered")
+                    threading.Thread(target=typing_until_reply, args=(tok,), daemon=True).start()
+                except Exception as e:  # noqa: BLE001
+                    log(f"handling {msg.get('message_id')} failed: {e}")
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                # a duplicate getUpdates consumer: remove it instead of fighting it
+                subprocess.run(["/usr/bin/pkill", "-f", "claude-plugins-official/telegram"], check=False)
+                log("409: duplicate consumer found and stopped")
+                time.sleep(5)
+            else:
+                log(f"HTTP {e.code}: {e}")
+                time.sleep(10)
+        except Exception as e:  # noqa: BLE001
+            log(f"loop error: {e}")
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()

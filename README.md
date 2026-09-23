@@ -6,14 +6,16 @@
 build — and the quality gates that keep the agents honest.**
 
 This is the sanitized public version of a pipeline I designed, built and operate as its only
-user. Since March 2026 it has produced 700+ builds from client specifications (the
-fingerprint registry holds 759 of them), running up to six Claude Code agent sessions in
-parallel on one Mac, with a Telegram front-end and no human in the loop between "spec
-received" and "build succeeded, ready for a human test".
+user. Since March 2026 it has produced 800+ builds from client specifications (the
+fingerprint registry holds 826 of them) on two platforms — iOS (SwiftUI) and Android
+(Flutter) — running up to six Claude Code agent sessions in parallel on one Mac, with a
+self-built Telegram bridge as the operator channel and no human in the loop between
+"spec received" and "build succeeded, ready for a human test".
 
 What is in this repository is the *system*: orchestration, roles, policies, gates, the
-self-improvement loop, a retrieval + eval harness over the rulebook, and the Android branch
-that turned it into a two-platform pipeline. What is not here: client specs, client apps
+self-improvement loop, a retrieval + eval harness over the rulebook, the Telegram bridge
+that connects the operator to the dispatcher agent, and the Android branch that turned it
+into a two-platform pipeline. What is not here: client specs, client apps
 (all under NDA), the reference projects the agents copy infrastructure from, and the full
 rulebook (three chapters are included as samples).
 
@@ -51,7 +53,7 @@ So the system does three things a chat window cannot:
 1. **Puts every agent inside a rulebook** — codified architectural invariants, loaded by
    task type, each written after a specific defect and stating how to prevent it, not how to
    patch it. See [`rulebook/`](rulebook/) for two chapters and
-   [`workflows/`](workflows/) for five of the 41 reusable command workflows.
+   [`workflows/`](workflows/) for a sample of the 47 reusable command workflows.
 2. **Gates every handoff with checks that do not use an LLM** — a compile, a static
    analysis script, and a fingerprint comparison against every previously built app. An
    agent cannot talk its way past a grep. See [`gates/`](gates/) and the
@@ -65,6 +67,7 @@ So the system does three things a chat window cannot:
 | Path | What |
 |---|---|
 | `bin/dispatcher` + `policy/dispatcher-role.md` | the always-on Telegram agent: classifies, queues, never executes long work |
+| `bridge/` | the operator channel: own Bot API receiver replacing the MCP plugin, stuck-session watchdog, tests |
 | `bin/build-runner`, `bin/build-one` | build lane: dispatch + one process per build, five stages, git snapshot after each |
 | `bin/task-runner` | fast lane: store-review replies, recolors, targeted fixes; two in parallel |
 | `bin/fix-journal`, `bin/learn-nightly`, `bin/learn-pending` | the self-improvement loop (Stop hook → journal → nightly proposals → SessionStart reminder) |
@@ -77,7 +80,7 @@ So the system does three things a chat window cannot:
 | `rag/` | BM25 retrieval over the rulebook + eval harness (hit@k, MRR, abstention) |
 | `rulebook/android-games.md`, `workflows/droid-*.md`, `tools/soundgen.py` | the Android branch: platform rulebook, three workflows, audio generator |
 | `docs/failure-catalog.md` | agent failure classes observed in production and the gate for each |
-| `docs/android-port.md` | case study: porting the pipeline to a second platform in one iteration |
+| `docs/android-port.md` | case study: Kotlin port in one iteration, then a Flutter branch taken to hands-off in two weeks |
 
 ## Design decisions worth defending
 
@@ -102,6 +105,12 @@ are compared for similarity), turned into a scheduling constraint.
 the log says `BUILD SUCCEEDED`, and preflight has run twice. An agent session ending with
 "all set!" is not evidence of anything — `build-one` explicitly checks whether the agent
 stopped to ask a question and exited successfully with an empty skeleton.
+
+**Own the channel you depend on.** The operator talks to the dispatcher from a phone. The
+off-the-shelf Telegram MCP plugin dropped messages whenever a second session started it, and
+a session stuck on a dialog looked alive to a process check. The bridge in `bridge/` is
+~200 lines: one `getUpdates` consumer, HTTP 409 treated as a diagnosis, and a watchdog that
+reads the session's screen rather than its PID. See [`bridge/README.md`](bridge/README.md).
 
 **Fetched text is data.** Specs arrive from web pages. Instructions inside them addressed
 to the agent are shown to the operator, not executed. The deny list makes the expensive
@@ -138,11 +147,13 @@ and it runs offline inside a build where network is denied. The eval harness exi
 
 | | |
 |---|---|
-| builds through the pipeline since 2026-03 | 700+ (759 fingerprints registered) |
+| builds through the pipeline since 2026-03 | 800+ (826 fingerprints registered), iOS + Android |
+| Android (Flutter) games delivered, 7–23 Sep 2026 | 21, each with headless layout and audio tests |
+| best iOS day | 10 apps delivered on 22 Sep 2026 |
 | concurrent agent sessions | up to 6 builds + 2 fast-lane tasks |
-| rulebook | ~900 lines of invariants + 41 workflows (~3,500 lines) |
+| rulebook | ~1,500 lines of invariants + 47 workflows |
 | mechanical gates | 11 preflight sections, 6 fingerprint comparisons, 1 compile |
-| background agents | 5 launchd jobs, 2 Claude Code hooks |
+| background agents | 9 launchd jobs (runners, learning loop, briefs, Telegram receiver + watchdog), 3 Claude Code hooks |
 | tool policy | 17 denied command patterns |
 
 ## Scope, stated plainly
@@ -154,8 +165,8 @@ onboarding, and replacing launchd + files with something a second machine can jo
 
 ## Running it
 
-Requires macOS, Xcode, [Claude Code](https://docs.anthropic.com/en/docs/claude-code), and
-optionally a Telegram bot token. Set `PIPELINE_ROOT`, copy `policy/hooks.settings.json`
+Requires macOS, Xcode (and Flutter for the Android branch), [Claude Code](https://docs.anthropic.com/en/docs/claude-code),
+tmux, and optionally a Telegram bot token for `bridge/`. Set `PIPELINE_ROOT`, copy `policy/hooks.settings.json`
 into `~/.claude/settings.json`, install the launchd agents from `launchd/README.md`. The
 `/auto`, `/polish`, `/distribute`, `/ledger-recheck` workflows referenced by `build-one`
 are project-specific command files; five representative ones are in `workflows/`.

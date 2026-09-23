@@ -53,3 +53,54 @@ The port took one iteration because roles, gates and the definition of done were
 formalised; only the platform knowledge had to be written down. That is the argument for
 keeping platform rules separate from pipeline rules — and the reason the iOS chapters say
 "do not apply to Android" at the top.
+
+---
+
+# Second iteration: a Flutter pipeline, from zero to hands-off in about two weeks
+
+The Kotlin port above proved the orchestration was platform-agnostic, but each Kotlin game
+was still a hand-held build. In September 2026 the Android branch was rebuilt on Flutter
+and taken to the same hands-off level as iOS: spec in, tested release-ready project out.
+
+| | |
+|---|---|
+| first Flutter game accepted by the client | 7 Sep 2026 |
+| games delivered through the Flutter branch by 23 Sep | 21 (plus the Kotlin one) |
+| typical game | 5–7k lines of Dart, no network code, no permissions, two dependencies |
+| games shipping the headless test set | 21 of 21 audio-context and size-sweep, 20 of 21 solver/fairness, 19 of 21 overlay and transition |
+| pre-delivery gate | one script (`droidcheck`) replacing the manual checklist |
+
+## What made it hands-off
+
+The same move as on iOS: every defect the operator caught became a rule *and* a check the
+agent runs itself, so the operator stops being the test suite.
+
+- **Headless rendering instead of an emulator.** Agents never launch the app (it burns the
+  first-launch flag on the operator's test device). Instead each project renders its main
+  screens to PNG at 360 / 390 / 800 pt; any layout overflow fails the test, and the sheets
+  are reviewed as images before delivery.
+- **Bugs turned into tests, not notes.**
+  - Music stopped after the first sound effect: on Android every player requests audio
+    focus by default, so the first SFX paused the music for good. Fix: a global audio
+    context with focus disabled, and a test that the context constructs without an
+    assertion (a debug assert once silently killed all players).
+  - Overlays stuck to the top of the screen under the status bar: an inner `Align` in the
+    shared clamp widget always wins over an outer `Center`. Fix: an alignment parameter on
+    the clamp plus a test that the panel's centre sits in the middle band of the screen.
+  - Screen transitions showed two scenes at once: `Threshold(0)` evaluates to 1 on the whole
+    interval, so the outgoing screen stayed fully opaque. A test now asserts its opacity is 0
+    on the first frame after the switch.
+  - Coins multiplied after reinstall: Android Auto Backup restored preferences. Backup is
+    disabled in the manifest from the first build.
+- **Fairness checked by a solver.** "The level is winnable" is not a claim an agent may
+  make; in 20 of 21 games a solver or fairness test plays the generated levels within the
+  move budget.
+- **Idle means idle.** Every screen must reach zero frames per second at rest; animations
+  are finite one-shots, never `repeat()` on a scene.
+
+## Why it took two weeks and not two months
+
+Nothing in the queue, runners, gates or hooks changed. The work was writing down platform
+knowledge in the same symptom → cause → invariant form and wiring each invariant to a check.
+The rate-limiting step was the operator noticing a defect once; after that, no agent could
+repeat it.

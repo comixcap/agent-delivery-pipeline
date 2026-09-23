@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>pipeline.tg-poll</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>PIPELINE_ROOT/bridge/tg-poll</string></array>
+  <key>EnvironmentVariables</key><dict><key>PIPELINE_TG_CHAT</key><string>YOUR_CHAT_ID</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+</dict></plist>

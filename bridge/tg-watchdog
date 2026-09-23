@@ -1,0 +1,41 @@
+#!/bin/zsh
+# Bridge watchdog. launchd runs it at login and every 5 minutes.
+# Does nothing if the bridge is healthy or was stopped on purpose (tg-off).
+export PATH="/opt/homebrew/bin:/usr/bin:/bin"
+BASE="${PIPELINE_BRIDGE_DIR:-$HOME/.pipeline/telegram}"
+SESSION="${PIPELINE_TMUX_SESSION:-claude-tg}"
+LOG="$BASE/watchdog.log"
+STUCK="$BASE/.stuck"
+stamp() { date '+%Y-%m-%d %H:%M:%S'; }
+
+[ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 100000 ] && { tail -n 100 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"; }
+[ -f "$BASE/.paused" ] && exit 0                     # stopped on purpose
+[ -f "$BASE/.env" ] || { echo "$(stamp) no token" >> "$LOG"; exit 0; }
+
+# Lesson: a bot can have exactly ONE getUpdates consumer. If some session starts the old
+# MCP plugin again, it steals messages and the channel "drops". Kill the duplicate at once.
+if pgrep -f "claude-plugins-official/telegram.*server.ts" >/dev/null 2>&1; then
+  pkill -f "claude-plugins-official/telegram" 2>/dev/null
+  echo "$(stamp) duplicate listener (MCP plugin) stopped" >> "$LOG"
+fi
+
+# Lesson: "the session exists" is not "the bridge is alive". After a CLI auto-update the
+# agent sat for a day on a trust-this-folder dialog and a process check saw nothing wrong.
+# So look INSIDE the pane: a blocking dialog or login prompt seen on two consecutive runs
+# (>= 5 min) means dead -> restart and tell the operator why.
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  PANE=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null | tail -30)
+  BLOCK=$(echo "$PANE" | grep -m1 -E "Enter to confirm|Esc to cancel|[Ss]elect login|could not be refreshed|Failed to authenticate")
+  [ -z "$BLOCK" ] && { rm -f "$STUCK"; exit 0; }     # healthy
+  SIG=$(echo "$PANE" | md5 -q 2>/dev/null || echo "$PANE" | md5sum)
+  PREV=$(cat "$STUCK" 2>/dev/null); echo "$SIG" > "$STUCK"
+  [ "$SIG" != "$PREV" ] && exit 0                     # first sighting: give it 5 minutes
+  echo "$(stamp) bridge stuck on: $BLOCK - restarting" >> "$LOG"
+  tmux kill-session -t "$SESSION" 2>/dev/null; rm -f "$STUCK"
+  TOK=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$BASE/.env")
+  [ -n "$TOK" ] && [ -n "$PIPELINE_TG_CHAT" ] && curl -s -X POST "https://api.telegram.org/bot${TOK}/sendMessage" \
+    --data-urlencode "chat_id=$PIPELINE_TG_CHAT" \
+    --data-urlencode "text=Bridge was stuck (${BLOCK[1,80]}) - restarted. If it is a login prompt: claude -> /login" >/dev/null 2>&1
+fi
+echo "$(stamp) no bridge - starting" >> "$LOG"
+"$(dirname "$0")/tg-on" >> "$LOG" 2>&1

@@ -1,0 +1,15 @@
+#!/bin/zsh
+# Start the dispatcher agent in a detached tmux session; the terminal can be closed.
+# Usage: tg-on [workdir]
+export PATH="/opt/homebrew/bin:$PATH"
+BASE="${PIPELINE_BRIDGE_DIR:-$HOME/.pipeline/telegram}"
+SESSION="${PIPELINE_TMUX_SESSION:-claude-tg}"
+WORKDIR="${1:-$HOME/Desktop}"
+ROLE="$(cd "$(dirname "$0")/.." && pwd)/policy/dispatcher-role.md"
+rm -f "$BASE/.paused"
+[ -f "$BASE/.env" ] || { echo "no token in $BASE/.env"; exit 1; }
+tmux has-session -t "$SESSION" 2>/dev/null && { echo "bridge already running ($SESSION)"; exit 0; }
+tmux new-session -d -s "$SESSION" -c "$WORKDIR" \
+  "claude --append-system-prompt \"\$(cat '$ROLE')\" --allowedTools \"\$(cat '$(dirname "$ROLE")/allow-tools.txt' | tr '\n' ' ')\""
+sleep 2
+tmux has-session -t "$SESSION" 2>/dev/null && echo "bridge started in $WORKDIR" || { echo "failed to start"; exit 1; }
